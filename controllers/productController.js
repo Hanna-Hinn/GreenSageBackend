@@ -397,7 +397,7 @@ const getProduct = asyncWrapper(async (req, res, next) => {
         ratingCount,
         ratingDetails,
         ownerDetails,
-        ...product,
+        ...product?._doc,
       },
       relatedProducts: allRelatedProductsDetails,
     },
@@ -1061,7 +1061,7 @@ const searchAndFilterProductsV2 = asyncWrapper(async (req, res, next) => {
   try {
     const searchTerm = req.query.query || "";
     const categoryFilter = req.query.category;
-    const subCategoryFilter = req.query.category;
+    const subCategoryFilter = req.query.subCategory;
     const userId = req.query.userId;
 
     let userConditions = [];
