@@ -27,6 +27,9 @@ const createProduct = asyncWrapper(async (req, res, next) => {
     availableInStock,
     imageUrl,
     categoryId,
+    quantityType,
+    subCategory,
+    avoidIf = [],
     newAdded,
     featured,
     popular,
@@ -41,14 +44,11 @@ const createProduct = asyncWrapper(async (req, res, next) => {
     !imageUrl ||
     !categoryId
   ) {
-    console.log("Missing required fields");
     return next(createCustomError("Please provide all required fields", 400));
   }
 
-  // Check for existing product with the same name and description
-  const existingProduct = await Product.findOne({ name, description });
-
-  if (existingProduct) {
+  const duplicate = await Product.findOne({ name, description });
+  if (duplicate) {
     return next(
       createCustomError(
         "Product with the same name and description already exists",
@@ -58,30 +58,38 @@ const createProduct = asyncWrapper(async (req, res, next) => {
   }
 
   const category = await Category.findById(categoryId);
+  if (!category) return next(createCustomError("Category does not exist", 400));
 
-  if (!category) {
-    return next(createCustomError("Category does notexist", 400));
+  if (subCategory) {
+    const match = category.subCategories?.some(
+      (sc) => sc.toLowerCase() === subCategory.toLowerCase()
+    );
+    if (!match) {
+      return next(
+        createCustomError(
+          `Sub-category "${subCategory}" is not defined for category "${category.name}"`,
+          400
+        )
+      );
+    }
   }
 
-  // Fetch user details
-  const createdBy = req.user.id;
-  const user = await User.findOne({ _id: createdBy });
-  // console.log(user);
-  // Access user's firstName
-  const firstName = user.firstName;
-  const lastName = user.lastName;
-  // console.log(firstName + lastName);
+  const creator = await User.findById(req.user.id).lean();
+  const owner = creator
+    ? `${creator.firstName} ${creator.lastName}`
+    : "Unknown";
 
-  const owner = `${firstName} ${lastName}`;
-
-  // const product = await Product.create(req.body, owner);   // Or
   const product = await Product.create({
     name,
     description,
     price,
     availableInStock,
     imageUrl,
-    categoryId,
+    category: categoryId,
+    ...(quantityType && { quantityType }),
+    ...(subCategory && { subCategory }),
+    ...(Array.isArray(avoidIf) &&
+      avoidIf.length && { avoidIf: avoidIf.map((c) => c.toLowerCase()) }),
     owner,
     newAdded,
     featured,
@@ -89,62 +97,31 @@ const createProduct = asyncWrapper(async (req, res, next) => {
     topSelling,
   });
 
-  // Emit product notification to both connected and not logged in users
   const productNotification = {
     message: "A new product has been created!",
-    product: product,
+    product,
   };
-
   emitProductNotificationToConnectedUsers(productNotification);
 
-  // Store product notification for users who are not currently connected
   const allUsers = await User.find({});
-  for (const user of allUsers) {
-    const userIdString = user._id.toString();
+  for (const u of allUsers) {
+    const uid = u._id.toString();
+    const isConnected = [...connectedUsers.values()].some(
+      (cu) => cu._id.toString() === uid
+    );
 
-    let userIsConnected = false;
-
-    // Iterate over the values in the connectedUsers Map
-    for (const connectedUser of connectedUsers.values()) {
-      // Check if the user ID matches
-      if (connectedUser._id.toString() === userIdString) {
-        console.log(
-          `User with ID ${userIdString} is currently connected, skipping notification storage`
-        );
-        userIsConnected = true;
-
-        const newNotification = new Notification({
-          userId: connectedUser._id,
-          product: productNotification.product._id, // You need to define the product structure in your model
-        });
-        await newNotification.save();
-
-        break; // Exit the inner loop since we found the user
-      }
-    }
-
-    // If the user is not connected, store the notification
-    if (!userIsConnected) {
-      console.log(
-        `Notification stored for not connected user with ID: ${userIdString}`
-      );
-      if (!productNotifications.has(userIdString)) {
-        productNotifications.set(userIdString, []);
-      }
-      productNotifications.get(userIdString).push(productNotification);
+    if (isConnected) {
+      await new Notification({ userId: uid, product: product._id }).save();
+    } else {
+      if (!productNotifications.has(uid)) productNotifications.set(uid, []);
+      productNotifications.get(uid).push(productNotification);
     }
   }
 
-  console.log("Connected Users:", connectedUsers);
+  await category.updateOne({ $push: { products: product._id } });
 
-  // console.log(productNotifications);
-
-  // Update the associated category with the new product reference
-  await category.updateOne({ $push: { products: product._id } }, { new: true });
-
-  console.log("Product created successfully");
   res.status(201).json({
-    msg: `Product created successfully`,
+    msg: "Product created successfully",
     success: true,
     data: product,
   });
@@ -225,6 +202,7 @@ const getProducts = asyncWrapper(async (req, res, next) => {
         featured: product.featured,
         popular: product.popular,
         topSelling: product.topSelling,
+        ...product,
       };
     })
   );
@@ -418,6 +396,7 @@ const getProduct = asyncWrapper(async (req, res, next) => {
         ratingCount,
         ratingDetails,
         ownerDetails,
+        ...product,
       },
       relatedProducts: allRelatedProductsDetails,
     },
@@ -714,6 +693,7 @@ const filter = asyncWrapper(async (req, res, next) => {
         featured: product.featured,
         popular: product.popular,
         topSelling: product.topSelling,
+        ...product,
       };
     })
   );
@@ -852,6 +832,7 @@ const getUserRelatedProducts = asyncWrapper(async (req, res, next) => {
         featured: product.featured,
         popular: product.popular,
         topSelling: product.topSelling,
+        ...product,
       };
     })
   );
@@ -1155,5 +1136,5 @@ module.exports = {
   searchAndFilter,
   getUserNotifications,
   getRecommendedProducts,
-  searchAndFilterProductsV2
+  searchAndFilterProductsV2,
 };
