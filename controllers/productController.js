@@ -85,6 +85,7 @@ const createProduct = asyncWrapper(async (req, res, next) => {
     price,
     availableInStock,
     imageUrl,
+    categoryId,
     category: categoryId,
     ...(quantityType && { quantityType }),
     ...(subCategory && { subCategory }),
