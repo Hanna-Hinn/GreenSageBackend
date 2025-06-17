@@ -22,6 +22,9 @@ const mapAddresses = (addresses = []) =>
 
 // createUser Endpoint/API
 const createUser = asyncWrapper(async (req, res, next) => {
+  console.log(
+    `Received the Following Body : ${JSON.stringify(req.body, null, 2)}`
+  );
   const {
     firstName,
     lastName,
@@ -54,6 +57,22 @@ const createUser = asyncWrapper(async (req, res, next) => {
     console.log("Duplicate email");
     return next(createCustomError("Email already exists", 400));
   }
+
+  console.log(
+    `Creating User with the following details ${JSON.stringify({
+      firstName,
+      lastName,
+      email,
+      mobile,
+      password,
+      imageUrl,
+      role: "owner",
+      addresses: mapAddresses(addresses),
+      healthStatus,
+      diagnosedDiseases: normaliseDiseases(diagnosedDiseases),
+      description,
+    })}`
+  );
 
   const user = await User.create({
     firstName,

@@ -1027,6 +1027,18 @@ const getUserNotifications = asyncWrapper(async (req, res, next) => {
   });
 });
 
+const extractHealthConditions = (healthStatus = {}) => {
+  const base = Object.keys(healthStatus).filter(
+    (k) => healthStatus[k] === true // only active
+  );
+
+  if (healthStatus.otherCheck && healthStatus.others) {
+    base.push(healthStatus.others);
+  }
+
+  return base;
+};
+
 const getRecommendedProducts = asyncWrapper(async (req, res, next) => {
   try {
     const userId = req.params.userId;
@@ -1035,13 +1047,10 @@ const getRecommendedProducts = asyncWrapper(async (req, res, next) => {
       return next(createCustomError(`Invalid userId ID: ${userId}`, 404));
     }
 
-    const conditionsToAvoid = [];
-    if (user.diagnosedDiseases) {
-      conditionsToAvoid.push(...user.diagnosedDiseases);
-    }
-    if (user.healthStatus) {
-      conditionsToAvoid.push(...user.healthStatus);
-    }
+    const conditionsToAvoid = [
+      ...(user.diagnosedDiseases || []),
+      ...extractHealthConditions(user.healthStatus),
+    ];
 
     const recommendedProducts = await Product.find({
       avoidIf: { $nin: conditionsToAvoid },
@@ -1068,12 +1077,8 @@ const searchAndFilterProductsV2 = asyncWrapper(async (req, res, next) => {
     if (userId) {
       const user = await User.findById(userId).lean();
       if (user) {
-        if (user.diagnosedDiseases) {
-          userConditions.push(...user.diagnosedDiseases);
-        }
-        if (user.healthStatus) {
-          userConditions.push(...user.healthStatus);
-        }
+        userConditions.push(...(user.diagnosedDiseases || []));
+        userConditions.push(...extractHealthConditions(user.healthStatus));
       }
     }
     const regexTerm = new RegExp(searchTerm, "i");
@@ -1091,7 +1096,7 @@ const searchAndFilterProductsV2 = asyncWrapper(async (req, res, next) => {
     if (categoryFilter) {
       const categoryQuery = mongoose.Types.ObjectId.isValid(categoryFilter)
         ? { _id: categoryFilter }
-        : { name: { $regext: newRegExp("^" + categoryFilter + "$", "i") } };
+        : { name: { $regex: new RegExp("^" + categoryFilter + "$", "i") } };
       const categoryDocs = await Category.find(categoryQuery).lean();
       categoryIds = categoryDocs.map((c) => c._id);
       if (categoryIds.length > 0) {
