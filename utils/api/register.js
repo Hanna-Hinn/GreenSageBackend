@@ -8,6 +8,23 @@ const User = require("../../models/userModel");
 const Cart = require("../../models/cartModel");
 const Favorite = require("../../models/favoriteModel");
 
+const VIT_KEYS = [
+  "vitaminD",
+  "vitaminC",
+  "magnesium",
+  "iron",
+  "vitaminB12",
+  "calcium",
+  "omega3",
+  "iodine",
+  "folate",
+  "zinc",
+];
+
+const defaultHealth = VIT_KEYS.reduce((obj, k) => ({ ...obj, [k]: false }), {
+  others: "",
+});
+
 router.post(
   "/api/register",
   asyncWrapper(async (req, res, next) => {
@@ -62,16 +79,29 @@ router.post(
         .filter((x) => typeof x === "string" && x.trim())
         .map((x) => x.trim().toLowerCase());
 
+    let healthStatusObj = defaultHealth;
+    if (Array.isArray(healthStatus)) {
+      healthStatusObj = {
+        ...defaultHealth,
+        ...healthStatus.reduce(
+          (obj, k) => (VIT_KEYS.includes(k) ? { ...obj, [k]: true } : obj),
+          {}
+        ),
+      };
+    } else if (healthStatus && typeof healthStatus === "object") {
+      healthStatusObj = { ...defaultHealth, ...healthStatus };
+    }
+
     const newUser = await User.create({
       firstName,
       lastName,
-      email,
+      email: email.trim().toLowerCase(),
       mobile,
       password,
       imageUrl,
       role: "customer",
       addresses: userAddresses,
-      healthStatus, // Set healthStatus object with only true values
+      healthStatus: healthStatusObj,
       diagnosedDiseases: normaliseDiseases(diagnosedDiseases),
     });
 
