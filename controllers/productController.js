@@ -18,6 +18,32 @@ const {
   emitProductNotificationToConnectedUsers,
 } = require("../socket");
 
+const ratingPopulate = {
+  path: "ratings",
+  select: "-ratingId -__v -productId",
+  populate: {
+    path: "userId",
+    model: "User",
+    select: "firstName lastName imageUrl",
+  },
+};
+
+const buildRatingDetails = (ratings = []) =>
+  ratings.map((r) => ({
+    _id: r._id,
+    title: r.title,
+    rating: r.rating,
+    description: r.description,
+    user: r.userId
+      ? {
+          _id: r.userId._id,
+          firstName: r.userId.firstName,
+          lastName: r.userId.lastName,
+          imageUrl: r.userId.imageUrl,
+        }
+      : null,
+  }));
+
 // createProduct Endpoint/API
 const createProduct = asyncWrapper(async (req, res, next) => {
   const {
@@ -131,85 +157,36 @@ const createProduct = asyncWrapper(async (req, res, next) => {
 // getProducts Endpoint/API
 const getProducts = asyncWrapper(async (req, res, next) => {
   const { pageNumber } = req.query;
-
-  if (!pageNumber) {
+  if (!pageNumber)
     return next(createCustomError("Page Number is missing", 400));
-  }
-
-  if (isNaN(pageNumber) || pageNumber < 1) {
+  if (isNaN(pageNumber) || pageNumber < 1)
     return next(createCustomError("Invalid Page Number", 400));
-  }
 
-  const newPageOffset = pageNumber === 1 ? 0 : (pageNumber - 1) * PAGE_SIZE;
+  const skip = pageNumber === 1 ? 0 : (pageNumber - 1) * PAGE_SIZE;
 
-  // Populate the 'ratings' field for each product
   const products = await Product.find({})
-    .skip(newPageOffset)
+    .skip(skip)
     .limit(PAGE_SIZE)
-    .populate({
-      path: "ratings",
-      select: "-ratingId -__v",
-    });
+    .populate(ratingPopulate) // <-- nested populate
+    .lean();
 
   const totalProducts = await Product.countDocuments({});
   const totalPages = Math.ceil(totalProducts / PAGE_SIZE);
-
-  if (pageNumber > totalPages) {
+  if (pageNumber > totalPages)
     return next(createCustomError("Page Number exceeds total pages", 400));
-  }
 
-  // Access the virtual field 'averageRating' for each product
   const productsWithDetails = await Promise.all(
-    products.map(async (product) => {
-      const categoryId = product.categoryId;
-      const categoryName = await getCategoryNameById(categoryId);
-
-      const averageRating = product.averageRating;
-
-      // Fetch user details for each rating
-      const userIds = product.ratings.map((rating) => rating.userId);
-      const ratingUsers = await Promise.all(
-        userIds.map((userId) => User.findById(userId))
-      );
-
-      // Extract relevant information from each user
-      const ratingDetails = product.ratings.map((rating, index) => ({
-        rating: {
-          _id: rating._id,
-          userName: ratingUsers[index]
-            ? `${ratingUsers[index].firstName} ${ratingUsers[index].lastName}`
-            : "Unknown",
-          title: rating.title,
-          rating: rating.rating,
-          description: rating.description,
-        },
-      }));
-
-      return {
-        _id: product._id,
-        owner: product.owner,
-        categoryName,
-        name: product.name,
-        description: product.description,
-        price: product.price,
-        availableInStock: product.availableInStock,
-        imageUrl: product.imageUrl,
-        cartItems: product.cartItems,
-        favorits: product.favorits,
-        averageRating,
-        ratingCount: product.ratings.length,
-        ratingDetails,
-        newAdded: product.newAdded,
-        featured: product.featured,
-        popular: product.popular,
-        topSelling: product.topSelling,
-        ...product,
-      };
-    })
+    products.map(async (p) => ({
+      ...p,
+      categoryName: await getCategoryNameById(p.categoryId),
+      averageRating: p.averageRating,
+      ratingCount: p.ratings.length,
+      ratingDetails: buildRatingDetails(p.ratings),
+    }))
   );
 
   res.status(200).json({
-    msg: `Products fetched successfully`,
+    msg: "Products fetched successfully",
     success: true,
     data: { products: productsWithDetails, totalProducts, totalPages },
   });
@@ -219,187 +196,75 @@ const getProducts = asyncWrapper(async (req, res, next) => {
 const getProduct = asyncWrapper(async (req, res, next) => {
   const { id: productId } = req.params;
 
-  // Check if the productId is a valid ObjectId
+  /* ---------- validate ID ---------- */
   if (!mongoose.Types.ObjectId.isValid(productId)) {
     return next(createCustomError(`Invalid productId ID: ${productId}`, 400));
   }
-  // -----------------------------------------------------------------------------------------------------
-  // Fetch the product and populate its 'ratings' field
-  const product = await Product.findById(productId).populate(
-    "ratings",
-    "-ratingId -__v"
-  );
 
-  // Check if the productId exists
+  /* ---------- fetch product with nested ratings+user ---------- */
+  const product = await Product.findById(productId)
+    .populate(ratingPopulate)
+    .lean({ virtuals: true });
+
   if (!product) {
     return next(createCustomError(`No product with id: ${productId}`, 404));
   }
 
-  // Calculate the average rating
-  // const averageRating = product.averageRating;
-
-  const categoryId = product.categoryId;
-
-  // Fetch the category and all its fields
-  // const category = await Category.findById(categoryId);
-
-  // Fetch the category name
-  const categoryName = await getCategoryNameById(categoryId);
-
-  // Return the count of ratings
+  /* ---------- basic derived fields ---------- */
+  const categoryName = await getCategoryNameById(product.categoryId);
+  const ratingDetails = buildRatingDetails(product.ratings);
   const ratingCount = product.ratings.length;
+  const averageRating = product.averageRating; // virtual field
 
-  const ownerName = product.owner;
-  // Split the full name into an array of first and last names
-  const nameParts = ownerName.split(" ");
-  // Extract firstName and lastName
-  const firstName = nameParts[0]; // "John"
-  const lastName = nameParts.slice(1).join(" "); // "Doe"
-
+  /* ---------- owner details ---------- */
+  const [firstName, ...lastArr] = (product.owner || "").split(" ");
+  const lastName = lastArr.join(" ");
   const ownerDetails = await User.find(
-    {
-      firstName: firstName,
-      lastName: lastName,
-    },
-    {
-      healthStatus: 0,
-      ratings: 0,
-      orders: 0,
-    }
+    { firstName, lastName },
+    { healthStatus: 0, ratings: 0, orders: 0 }
+  ).lean();
+
+  /* ---------- related products ---------- */
+  const rawRelated = await fetchRelatedProducts(productId);
+
+  const relatedProducts = await Promise.all(
+    rawRelated.map(async (p) => {
+      // populate ratings->user on each related product
+      const populated = await Product.findById(p._id)
+        .populate(ratingPopulate)
+        .lean({ virtuals: true });
+
+      return {
+        _id: populated._id,
+        owner: populated.owner,
+        categoryName,
+        name: populated.name,
+        description: populated.description,
+        price: populated.price,
+        availableInStock: populated.availableInStock,
+        imageUrl: populated.imageUrl,
+        relatedProductAverageRating: populated.averageRating,
+        ratingCount: populated.ratings.length,
+        ratingDetails: buildRatingDetails(populated.ratings),
+        averageRating: populated.averageRating,
+      };
+    })
   );
 
-  // console.log(ownerDetails);
-
-  // Fetch user details for each rating
-  const userIds = product.ratings.map((rating) => rating.userId);
-  const ratingUsers = await Promise.all(
-    userIds.map((userId) => User.findById(userId))
-  );
-  // Extract relevant information from each user
-  // const ratingUserNames = ratingUsers.map(user => user ? `${user.firstName} ${user.lastName}` : "Unknown");
-
-  // Extract relevant information from each user
-  const ratingDetails = product.ratings.map((rating, index) => ({
-    rating: {
-      _id: rating._id,
-      userName: ratingUsers[index]
-        ? `${ratingUsers[index].firstName} ${ratingUsers[index].lastName}`
-        : "Unknown",
-      userImage: ratingUsers[index] ? ratingUsers[index].imageUrl : "Unknown",
-      title: rating.title,
-      rating: rating.rating,
-      description: rating.description,
-      // userId: rating.userId,
-      // productId: rating.productId,
-    },
-  }));
-
-  // Fetch relatedProducts
-  const relatedProducts = await fetchRelatedProducts(productId);
-  // console.log(relatedProducts);
-  // Map over related products and fetch details
-  const relatedProductsDetails = relatedProducts.map(async (relatedProduct) => {
-    const ratingsLength = relatedProduct.ratings.length;
-
-    const relatedProductAverageRating =
-      ratingsLength > 0
-        ? relatedProduct.ratings.reduce(
-            (acc, rating) => acc + Number(rating.rating),
-            0
-          ) / ratingsLength
-        : 0;
-
-    // console.log(relatedProductAverageRating);
-
-    // Fetch user details for each rating
-    const relatedProductUserIds = relatedProduct.ratings.map(
-      (rating) => rating.userId
-    );
-    const relatedProductRatingUsers = await Promise.all(
-      relatedProductUserIds.map((userId) => User.findById(userId))
-    );
-
-    const ownerName = relatedProduct.owner;
-    // Split the full name into an array of first and last names
-    const nameParts = ownerName.split(" ");
-    // Extract firstName and lastName
-    const firstName = nameParts[0]; // "John"
-    const lastName = nameParts.slice(1).join(" "); // "Doe"
-
-    const relatedProductOwnerDetails = await User.find(
-      {
-        firstName: firstName,
-        lastName: lastName,
-      },
-      {
-        healthStatus: 0,
-        ratings: 0,
-        orders: 0,
-      }
-    );
-
-    const relatedProductsRtingDetails = relatedProduct.ratings.map(
-      (rating, index) => ({
-        rating: {
-          _id: rating._id,
-          userName: relatedProductRatingUsers[index]
-            ? `${relatedProductRatingUsers[index].firstName} ${relatedProductRatingUsers[index].lastName}`
-            : "Unknown",
-          userImage: relatedProductRatingUsers[index]
-            ? relatedProductRatingUsers[index].imageUrl
-            : "Unknown",
-          title: rating.title,
-          rating: rating.rating,
-          description: rating.description,
-          // userId: rating.userId,
-          // productId: rating.productId,
-        },
-      })
-    );
-
-    return {
-      _id: relatedProduct._id,
-      owner: relatedProduct.owner,
-      categoryName,
-      name: relatedProduct.name,
-      description: relatedProduct.description,
-      price: relatedProduct.price,
-      availableInStock: relatedProduct.availableInStock,
-      imageUrl: relatedProduct.imageUrl,
-      cartItems: relatedProduct.cartItems,
-      favorits: relatedProduct.favorits,
-      relatedProductAverageRating,
-      ratingCount: relatedProduct.ratings.length,
-      relatedProductsRtingDetails,
-      relatedProductOwnerDetails,
-    };
-  });
-
-  // Wait for all related product details to be fetched
-  const allRelatedProductsDetails = await Promise.all(relatedProductsDetails);
-
+  /* ---------- response ---------- */
   res.status(200).json({
-    msg: `Product fetched successfully`,
+    msg: "Product fetched successfully",
     success: true,
     data: {
       product: {
-        _id: product._id,
-        owner: product.owner,
+        ...product,
         categoryName,
-        name: product.name,
-        description: product.description,
-        price: product.price,
-        availableInStock: product.availableInStock,
-        imageUrl: product.imageUrl,
-        cartItems: product.cartItems,
-        favorits: product.favorits,
-        averageRating: product.averageRating,
+        averageRating,
         ratingCount,
         ratingDetails,
         ownerDetails,
-        ...product?._doc,
       },
-      relatedProducts: allRelatedProductsDetails,
+      relatedProducts,
     },
   });
 });
@@ -408,74 +273,67 @@ const getProduct = asyncWrapper(async (req, res, next) => {
 const updateProduct = asyncWrapper(async (req, res, next) => {
   const { id: productId } = req.params;
 
-  // Check if the productId is a valid ObjectId
+  /* ---------- validation ---------- */
   if (!mongoose.Types.ObjectId.isValid(productId)) {
     return next(createCustomError(`Invalid productId ID: ${productId}`, 400));
   }
 
   const existingProduct = await Product.findById(productId);
-
-  // Check if the productId exists
   if (!existingProduct) {
     return next(createCustomError(`No product with id: ${productId}`, 404));
   }
 
-  // const existingProductData = {
-  //     name: existingProduct.name,
-  //     description: existingProduct.description,
-  //     price: existingProduct.price,
-  //     availableInStock: existingProduct.price,
-  //     imageUrl: existingProduct.imageUrl,
-  //     categoryId: existingProduct.categoryId
-  // }
+  /* ---------- update mongo document ---------- */
+  const updatedProduct = await Product.findByIdAndUpdate(productId, req.body, {
+    new: true,
+    runValidators: true,
+  });
 
-  // // Check if the req.body is the same as existing product data
-  // if (JSON.stringify(existingProductData) === JSON.stringify(req.body)) {
-  //     return next(createCustomError('Nothing to update', 400))
+  /* ---------- keep Category ⟷ Product references in sync ---------- */
+  const prevCategoryId = existingProduct.categoryId.toString();
+  const newCategoryIdRaw = req.body.categoryId || updatedProduct.categoryId;
+  const newCategoryId = newCategoryIdRaw.toString();
 
-  // }
-
-  // console.log(JSON.stringify(existingProductData));
-  // console.log(JSON.stringify(req.body));
-
-  // The approach to update the productId in Category
-  // Get the categoryId of the product
-
-  const updatedProduct = await Product.findByIdAndUpdate(
-    { _id: productId },
-    req.body,
-    {
-      new: true,
-      runValidators: true,
+  if (prevCategoryId !== newCategoryId) {
+    // ensure new category exists
+    const targetCategory = await Category.findById(newCategoryId);
+    if (!targetCategory) {
+      return next(createCustomError("Category does not exist", 400));
     }
-  );
 
-  const categoryId = await Category.findById(req.body.categoryId);
-
-  if (!categoryId) {
-    return next(createCustomError("Category does not exist", 400));
+    // pull from old category
+    await Category.findByIdAndUpdate(
+      prevCategoryId,
+      { $pull: { products: productId } },
+      { new: true }
+    );
+    // push into new category
+    await Category.findByIdAndUpdate(
+      newCategoryId,
+      { $push: { products: productId } },
+      { new: true }
+    );
   }
 
-  const existingCategoryId = existingProduct.categoryId;
+  /* ---------- fetch fresh doc with populated ratings & user ---------- */
+  const populated = await Product.findById(productId)
+    .populate(ratingPopulate)
+    .lean();
 
-  // Remove the product reference from the associated category
-  await Category.findByIdAndUpdate(
-    existingCategoryId,
-    { $pull: { products: productId } },
-    { new: true }
-  );
+  const categoryName = await getCategoryNameById(populated.categoryId);
+  const ratingDetails = buildRatingDetails(populated.ratings);
 
-  // Update the associated category with the new product reference
-  await Category.updateOne(
-    { _id: req.body.categoryId },
-    { $push: { products: productId } },
-    { new: true }
-  );
-
+  /* ---------- response ---------- */
   res.status(200).json({
-    msg: `Product updated successfully`,
+    msg: "Product updated successfully",
     success: true,
-    data: updatedProduct,
+    data: {
+      ...populated,
+      categoryName,
+      averageRating: populated.averageRating,
+      ratingCount: populated.ratings.length,
+      ratingDetails,
+    },
   });
 });
 
@@ -523,61 +381,81 @@ const search = asyncWrapper(async (req, res, next) => {
   const { pageNumber, categoryName, productName, description, ownerName } =
     req.query;
 
+  /* ---------- pagination checks ---------- */
   if (!pageNumber) {
     return next(createCustomError("Page Number is missing", 400));
   }
-
   if (isNaN(pageNumber) || pageNumber < 1) {
     return next(createCustomError("Invalid Page Number", 400));
   }
+  const skip = pageNumber === 1 ? 0 : (pageNumber - 1) * PAGE_SIZE;
 
-  const newPageOffset = pageNumber === 1 ? 0 : (pageNumber - 1) * PAGE_SIZE;
-
+  /* ---------- build query ---------- */
   const query = {};
 
+  // category by name (case-insensitive exact match)
   if (categoryName) {
-    // Make the search for category name case-insensitive
-    const categoryRegex = new RegExp(categoryName, "i");
-    const category = await Category.findOne({
-      name: { $regex: categoryRegex },
-    });
-
-    if (category) {
-      query.categoryId = category._id;
-    } else {
+    const catRegex = new RegExp(categoryName, "i");
+    const catDoc = await Category.findOne({ name: { $regex: catRegex } });
+    if (!catDoc) {
       return res
         .status(400)
         .json({ success: false, msg: "Category not found" });
     }
+    query.categoryId = catDoc._id;
   }
 
-  if (productName) {
-    query.name = { $regex: productName, $options: "i" };
+  // name / description partial matches
+  if (productName || description) {
+    query.$or = [];
+    if (productName) {
+      query.$or.push({ name: { $regex: new RegExp(productName, "i") } });
+    }
+    if (description) {
+      query.$or.push({ description: { $regex: new RegExp(description, "i") } });
+    }
   }
 
-  if (description) {
-    query.description = { $regex: description, $options: "i" };
-  }
-
+  // owner text search
   if (ownerName) {
     query.owner = { $regex: ownerName, $options: "i" };
   }
 
-  const products = await Product.find(query)
-    .skip(newPageOffset)
-    .limit(PAGE_SIZE);
+  /* ---------- fetch & count ---------- */
+  const [products, totalProducts] = await Promise.all([
+    Product.find(query)
+      .populate(ratingPopulate)
+      .skip(skip)
+      .limit(PAGE_SIZE)
+      .lean(),
+    Product.countDocuments(query),
+  ]);
 
-  const totalProducts = await Product.countDocuments(query);
   const totalPages = Math.ceil(totalProducts / PAGE_SIZE);
-
-  if (pageNumber > totalPages) {
+  if (pageNumber > totalPages && totalPages !== 0) {
     return next(createCustomError("Page Number exceeds total pages", 400));
   }
 
+  /* ---------- enrich each product ---------- */
+  const productsWithDetails = await Promise.all(
+    products.map(async (p) => ({
+      ...p,
+      categoryName: await getCategoryNameById(p.categoryId),
+      averageRating: p.averageRating,
+      ratingCount: p.ratings.length,
+      ratingDetails: buildRatingDetails(p.ratings),
+    }))
+  );
+
+  /* ---------- response ---------- */
   res.status(200).json({
     success: true,
     msg: "Products fetched successfully",
-    data: { products, totalProducts, totalPages },
+    data: {
+      products: productsWithDetails,
+      totalProducts,
+      totalPages,
+    },
   });
 });
 
@@ -586,122 +464,52 @@ const filter = asyncWrapper(async (req, res, next) => {
   const { pageNumber, topRated, newAdded, featured, popular, topSelling } =
     req.query;
 
+  /* ---------- pagination checks ---------- */
   if (!pageNumber) {
     return next(createCustomError("Page Number is missing", 400));
   }
-
   if (isNaN(pageNumber) || pageNumber < 1) {
     return next(createCustomError("Invalid Page Number", 400));
   }
+  const skip =
+    pageNumber === "1" || pageNumber === 1 ? 0 : (pageNumber - 1) * PAGE_SIZE;
 
-  const newPageOffset = pageNumber === 1 ? 0 : (pageNumber - 1) * PAGE_SIZE;
-
+  /* ---------- base query for boolean flags ---------- */
   const query = {};
+  if (newAdded === "true") query.newAdded = true;
+  if (featured === "true") query.featured = true;
+  if (popular === "true") query.popular = true;
+  if (topSelling === "true") query.topSelling = true;
 
-  // Populate the 'ratings' field for each product
-  const products = await Product.find({}).populate({
-    path: "ratings",
-    select: "-ratingId -__v",
-  });
+  /* ---------- fetch all candidates with ratings populated ---------- */
+  let products = await Product.find(query).populate(ratingPopulate).lean();
 
+  /* ---------- apply topRated filtering in-memory (needs averageRating) ---------- */
   if (topRated === "true") {
-    const filteredProducts = products.filter(
-      (product) => product.averageRating >= 3.5
-    );
-
-    const productIds = filteredProducts.map((product) => product._id);
-
-    query._id = { $in: productIds };
+    products = products.filter((p) => p.averageRating >= 3.5);
   }
 
-  if (newAdded === "true") {
-    // If topRated is true, filter products with average rating above 4.0
-    query.newAdded = true;
-  }
-
-  if (featured === "true") {
-    // If topRated is true, filter products with average rating above 4.0
-    query.featured = true;
-  }
-
-  if (popular === "true") {
-    // If topRated is true, filter products with average rating above 4.0
-    query.popular = true;
-  }
-
-  if (topSelling === "true") {
-    // If topRated is true, filter products with average rating above 4.0
-    query.topSelling = true;
-  }
-
-  const filterdProducts = await Product.find(query)
-    .populate({
-      path: "ratings",
-      select: "-ratingId -__v",
-    })
-    .skip(newPageOffset)
-    .limit(PAGE_SIZE);
-
-  const totalProducts = await Product.countDocuments(query);
+  const totalProducts = products.length;
   const totalPages = Math.ceil(totalProducts / PAGE_SIZE);
-
-  if (pageNumber > totalPages) {
+  if (pageNumber > totalPages && totalPages !== 0) {
     return next(createCustomError("Page Number exceeds total pages", 400));
   }
 
-  // Access the virtual field 'averageRating' for each product
+  /* ---------- slice for pagination ---------- */
+  const pageSlice = products.slice(skip, skip + PAGE_SIZE);
+
+  /* ---------- enrich each product ---------- */
   const productsWithDetails = await Promise.all(
-    filterdProducts.map(async (product) => {
-      const categoryId = product.categoryId;
-      const categoryName = await getCategoryNameById(categoryId);
-
-      const averageRating = product.averageRating;
-
-      // Fetch user details for each rating
-      const userIds = product.ratings.map((rating) => rating.userId);
-      const ratingUsers = await Promise.all(
-        userIds.map((userId) => User.findById(userId))
-      );
-
-      // Extract relevant information from each user
-      const ratingDetails = product.ratings.map((rating, index) => ({
-        rating: {
-          _id: rating._id,
-          userName: ratingUsers[index]
-            ? `${ratingUsers[index].firstName} ${ratingUsers[index].lastName}`
-            : "Unknown",
-          title: rating.title,
-          rating: rating.rating,
-          description: rating.description,
-        },
-      }));
-
-      return {
-        _id: product._id,
-        owner: product.owner,
-        categoryName,
-        name: product.name,
-        description: product.description,
-        price: product.price,
-        availableInStock: product.availableInStock,
-        imageUrl: product.imageUrl,
-        cartItems: product.cartItems,
-        favorits: product.favorits,
-        averageRating,
-        ratingCount: product.ratings.length,
-        ratingDetails,
-        newAdded: product.newAdded,
-        featured: product.featured,
-        popular: product.popular,
-        topSelling: product.topSelling,
-        ...product,
-      };
-    })
+    pageSlice.map(async (p) => ({
+      ...p,
+      categoryName: await getCategoryNameById(p.categoryId),
+      averageRating: p.averageRating,
+      ratingCount: p.ratings.length,
+      ratingDetails: buildRatingDetails(p.ratings),
+    }))
   );
 
-  // const averageRating = products.averageRating;
-  // console.log(averageRating);
-
+  /* ---------- response ---------- */
   res.status(200).json({
     msg: "Products fetched successfully",
     success: true,
@@ -712,135 +520,88 @@ const filter = asyncWrapper(async (req, res, next) => {
 // getUserRelatedProducts Endpoint/API
 const getUserRelatedProducts = asyncWrapper(async (req, res, next) => {
   const userId = req.params.userId;
-
   const { pageNumber } = req.query;
+
+  /* ---------- pagination checks ---------- */
   if (!pageNumber) {
     return next(createCustomError("Page Number is missing", 400));
   }
-
   if (isNaN(pageNumber) || pageNumber < 1) {
     return next(createCustomError("Invalid Page Number", 400));
   }
+  const skip =
+    pageNumber === "1" || pageNumber === 1 ? 0 : (pageNumber - 1) * PAGE_SIZE;
 
-  const newPageOffset = pageNumber === 1 ? 0 : (pageNumber - 1) * PAGE_SIZE;
-
-  // Find user by ID
-  const user = await User.findById(userId);
+  /* ---------- fetch user ---------- */
+  const user = await User.findById(userId).lean();
   if (!user) {
     return res.status(404).json({ success: false, error: "User not found" });
   }
 
-  // Build a query based on the healthStatus fields
-  const healthStatusQuery = Object.keys(user.healthStatus)
-    .filter(
-      (key) =>
-        key !== "others" &&
-        (user.healthStatus[key] ||
-          (key === "others" && user.healthStatus.others !== ""))
-    )
-    .map((key) => {
-      if (key === "others") {
-        const otherKeywords = user.healthStatus.others
-          .split(",")
-          .map((keyword) => keyword.trim());
-        return {
-          description: { $regex: otherKeywords.join("|"), $options: "i" },
-        };
-      } else {
-        return { description: new RegExp(key, "i") };
-      }
-    });
-
-  if (
-    healthStatusQuery.length === 0 &&
-    (!user.healthStatus.others || user.healthStatus.others === "")
-  ) {
-    return res.status(200).json({ success: true, data: [] }); // Both healthStatus and others are empty
-  }
-
-  // If 'others' field is not empty, search in 'others'
-  if (user.healthStatus.others && user.healthStatus.others !== "") {
-    const otherKeywords = user.healthStatus.others
-      .split(",")
-      .map((keyword) => keyword.trim());
-    healthStatusQuery.push({
-      description: { $regex: otherKeywords.join("|"), $options: "i" },
-    });
-  }
-
-  // Find products matching the healthStatus criteria
-  let products = await Product.find({ $or: healthStatusQuery })
-    .populate("ratings", "-ratingId -__v")
-    .skip(newPageOffset)
-    .limit(PAGE_SIZE);
-
-  const totalProducts = await Product.countDocuments({
-    $or: healthStatusQuery,
+  /* ---------- build health-status search tokens ---------- */
+  const healthStatusQuery = [];
+  Object.entries(user.healthStatus || {}).forEach(([key, val]) => {
+    if (key === "others" || key === "otherCheck") return;
+    if (val === true) {
+      healthStatusQuery.push({ description: new RegExp(key, "i") });
+    }
   });
-  const totalPages = Math.ceil(totalProducts / PAGE_SIZE);
+  if (user.healthStatus?.others) {
+    const otherWords = user.healthStatus.others
+      .split(",")
+      .map((w) => w.trim())
+      .filter(Boolean);
+    if (otherWords.length) {
+      healthStatusQuery.push({
+        description: { $regex: otherWords.join("|"), $options: "i" },
+      });
+    }
+  }
 
+  /* ---------- primary query (and fallback) ---------- */
+  const mongoQuery = healthStatusQuery.length ? { $or: healthStatusQuery } : {};
+
+  let [products, totalProducts] = await Promise.all([
+    Product.find(mongoQuery)
+      .populate(ratingPopulate)
+      .skip(skip)
+      .limit(PAGE_SIZE)
+      .lean(),
+    Product.countDocuments(mongoQuery),
+  ]);
+
+  // When no matches, fall back to "all products"
   if (totalProducts === 0) {
-    products = await Product.find()
-      .populate("ratings", "-ratingId -__v")
-      .skip(newPageOffset)
-      .limit(PAGE_SIZE);
-  } else if (pageNumber > totalPages) {
+    [products, totalProducts] = await Promise.all([
+      Product.find({})
+        .populate(ratingPopulate)
+        .skip(skip)
+        .limit(PAGE_SIZE)
+        .lean(),
+      Product.countDocuments({}),
+    ]);
+  }
+
+  const totalPages = Math.ceil(totalProducts / PAGE_SIZE);
+  if (pageNumber > totalPages && totalPages !== 0) {
     return next(createCustomError("Page Number exceeds total pages", 400));
   }
 
-  // Access the virtual field 'averageRating' for each product
+  /* ---------- enrich each product ---------- */
   const productsWithDetails = await Promise.all(
-    products.map(async (product) => {
-      const categoryId = product.categoryId;
-      const categoryName = await getCategoryNameById(categoryId);
-
-      const averageRating = product.averageRating;
-
-      // Fetch user details for each rating
-      const userIds = product.ratings.map((rating) => rating.userId);
-      const ratingUsers = await Promise.all(
-        userIds.map((userId) => User.findById(userId))
-      );
-
-      // Extract relevant information from each user
-      const ratingDetails = product.ratings.map((rating, index) => ({
-        rating: {
-          _id: rating._id,
-          userName: ratingUsers[index]
-            ? `${ratingUsers[index].firstName} ${ratingUsers[index].lastName}`
-            : "Unknown",
-          title: rating.title,
-          rating: rating.rating,
-          description: rating.description,
-        },
-      }));
-
-      return {
-        _id: product._id,
-        owner: product.owner,
-        categoryName,
-        name: product.name,
-        description: product.description,
-        price: product.price,
-        availableInStock: product.availableInStock,
-        imageUrl: product.imageUrl,
-        cartItems: product.cartItems,
-        favorits: product.favorits,
-        averageRating,
-        ratingCount: product.ratings.length,
-        ratingDetails,
-        newAdded: product.newAdded,
-        featured: product.featured,
-        popular: product.popular,
-        topSelling: product.topSelling,
-        ...product,
-      };
-    })
+    products.map(async (p) => ({
+      ...p,
+      categoryName: await getCategoryNameById(p.categoryId),
+      averageRating: p.averageRating,
+      ratingCount: p.ratings.length,
+      ratingDetails: buildRatingDetails(p.ratings),
+    }))
   );
 
+  /* ---------- response ---------- */
   res.status(200).json({
     success: true,
-    msg: `User related products fetched successfully`,
+    msg: "User related products fetched successfully",
     data: { productsWithDetails, totalProducts, totalPages },
   });
 });
@@ -860,89 +621,75 @@ const searchAndFilter = asyncWrapper(async (req, res, next) => {
     topSelling,
   } = req.query;
 
+  /* ---------- pagination checks ---------- */
   if (!pageNumber) {
     return next(createCustomError("Page Number is missing", 400));
   }
-
   if (isNaN(pageNumber) || pageNumber < 1) {
     return next(createCustomError("Invalid Page Number", 400));
   }
+  const skip =
+    pageNumber === "1" || pageNumber === 1 ? 0 : (pageNumber - 1) * PAGE_SIZE;
 
-  const newPageOffset = pageNumber === 1 ? 0 : (pageNumber - 1) * PAGE_SIZE;
-
+  /* ---------- build Mongo query ---------- */
   const query = {};
 
+  // 1) category by name (case-insensitive)
   if (categoryName) {
-    const categoryRegex = new RegExp(categoryName, "i");
-    const category = await Category.findOne({
-      name: { $regex: categoryRegex },
-    });
-
-    if (category) {
-      query.categoryId = category._id;
-    } else {
+    const catRegex = new RegExp(categoryName, "i");
+    const catDoc = await Category.findOne({ name: { $regex: catRegex } });
+    if (!catDoc) {
       return res
         .status(400)
         .json({ success: false, msg: "Category not found" });
     }
+    query.categoryId = catDoc._id;
   }
 
-  const nameRegex = productName ? new RegExp(productName, "i") : null;
-  const descriptionRegex = description ? new RegExp(description, "i") : null;
-
-  if (nameRegex || descriptionRegex) {
+  // 2) name / description partial matches
+  if (productName || description) {
     query.$or = [];
-    if (nameRegex) {
-      query.$or.push({ name: { $regex: nameRegex } });
+    if (productName) {
+      query.$or.push({ name: { $regex: new RegExp(productName, "i") } });
     }
-    if (descriptionRegex) {
-      query.$or.push({ description: { $regex: descriptionRegex } });
+    if (description) {
+      query.$or.push({
+        description: { $regex: new RegExp(description, "i") },
+      });
     }
   }
 
+  // 3) owner search
   if (ownerName) {
     query.owner = { $regex: ownerName, $options: "i" };
   }
-  const searchResults = await Product.aggregate([
-    {
-      $match: query, // Your existing query conditions
-    },
-    {
-      $lookup: {
-        from: "ratings",
-        localField: "_id",
-        foreignField: "productId",
-        as: "ratings",
-      },
-    },
-    {
-      $lookup: {
-        from: "categories", // Assuming your categories collection is named 'categories'
-        localField: "categoryId",
-        foreignField: "_id",
-        as: "category",
-      },
-    },
-    {
-      $addFields: {
-        averageRating: {
-          $ifNull: [{ $avg: "$ratings.rating" }, 0],
-        },
-        categoryName: {
-          $arrayElemAt: ["$category.name", 0], // Assuming 'name' is the field in the Category model
-        },
-      },
-    },
-    {
-      $project: {
-        category: 0, // Exclude the 'category' field
-        ratings: 0,
-      },
-    },
-  ]);
-  console.log(searchResults);
 
-  const filteredResults = applyFilterLogic(searchResults, {
+  /* ---------- fetch candidate products with ratings populated ---------- */
+  const rawProducts = await Product.find(query)
+    .populate(ratingPopulate)
+    .lean({ virtuals: true }); // include averageRating virtual in lean
+
+  /* ---------- enrich each product ---------- */
+  const enriched = await Promise.all(
+    rawProducts.map(async (p) => {
+      const avg =
+        p.ratings.length > 0
+          ? p.ratings.reduce((acc, r) => acc + Number(r.rating), 0) /
+            p.ratings.length
+          : 0;
+
+      return {
+        ...p,
+        categoryName: await getCategoryNameById(p.categoryId),
+        averageRating: avg,
+        ratingCount: p.ratings.length,
+        ratingDetails: buildRatingDetails(p.ratings),
+      };
+    })
+  );
+
+  /* ---------- filter logic for flags ---------- */
+  const afterFlags = applyFilterLogic(enriched, {
     topRated,
     newAdded,
     featured,
@@ -950,23 +697,21 @@ const searchAndFilter = asyncWrapper(async (req, res, next) => {
     topSelling,
   });
 
-  const totalFilteredProducts = filteredResults.length;
+  /* ---------- pagination ---------- */
+  const totalFilteredProducts = afterFlags.length;
   const totalPages = Math.ceil(totalFilteredProducts / PAGE_SIZE);
-
-  const paginatedResults = filteredResults.slice(
-    newPageOffset,
-    newPageOffset + PAGE_SIZE
-  );
-
-  if (pageNumber > totalPages) {
+  if (pageNumber > totalPages && totalPages !== 0) {
     return next(createCustomError("Page Number exceeds total pages", 400));
   }
 
+  const paginated = afterFlags.slice(skip, skip + PAGE_SIZE);
+
+  /* ---------- response ---------- */
   res.status(200).json({
     success: true,
     msg: "Products fetched successfully",
     data: {
-      products: paginatedResults,
+      products: paginated,
       totalProducts: totalFilteredProducts,
       totalPages,
     },
@@ -1039,26 +784,72 @@ const extractHealthConditions = (healthStatus = {}) => {
   return base;
 };
 
+const escapeRegex = (str = "") => str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 const getRecommendedProducts = asyncWrapper(async (req, res, next) => {
   try {
     const userId = req.params.userId;
+
+    /* ---------- fetch user ---------- */
     const user = await User.findById(userId).lean();
     if (!user) {
       return next(createCustomError(`Invalid userId ID: ${userId}`, 404));
     }
 
+    /* ---------- build avoid-list (diseases + health flags) ---------- */
     const conditionsToAvoid = [
       ...(user.diagnosedDiseases || []),
       ...extractHealthConditions(user.healthStatus),
-    ];
+    ].map((s) => s.toLowerCase());
 
-    const recommendedProducts = await Product.find({
-      avoidIf: { $nin: conditionsToAvoid },
-    }).populate("category");
+    /* ---------- build positive keyword list ---------- */
+    const keywords = Object.keys(user.healthStatus || {})
+      .filter((k) => k !== "others" && user.healthStatus[k] === true)
+      .concat(
+        user.healthStatus?.others
+          ? user.healthStatus.others
+              .split(",")
+              .map((w) => w.trim())
+              .filter(Boolean)
+          : []
+      )
+      .map((w) => w.toLowerCase());
+
+    const baseQuery = { avoidIf: { $nin: conditionsToAvoid } };
+    let finalQuery = baseQuery;
+
+    if (keywords.length) {
+      const regex = new RegExp(
+        keywords.map((k) => k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"),
+        "i"
+      );
+      finalQuery = {
+        ...baseQuery,
+        $or: [{ name: { $regex: regex } }, { description: { $regex: regex } }],
+      };
+    }
+
+    /* ---------- fetch products with populated ratings ---------- */
+    const products = await Product.find(finalQuery)
+      .populate(ratingPopulate)
+      .lean({ virtuals: true });
+
+    /* ---------- enrich each product ---------- */
+    const productsWithDetails = await Promise.all(
+      products.map(async (p) => ({
+        ...p,
+        categoryName: await getCategoryNameById(p.categoryId),
+        averageRating: p.averageRating,
+        ratingCount: p.ratings.length,
+        ratingDetails: buildRatingDetails(p.ratings),
+      }))
+    );
+
+    /* ---------- response ---------- */
     res.status(200).json({
       msg: "Products fetched successfully",
       success: true,
-      data: recommendedProducts,
+      data: productsWithDetails,
     });
   } catch (err) {
     console.error("Error in getRecommendedProducts:", err);
@@ -1068,64 +859,94 @@ const getRecommendedProducts = asyncWrapper(async (req, res, next) => {
 
 const searchAndFilterProductsV2 = asyncWrapper(async (req, res, next) => {
   try {
+    /* ---------- query params ---------- */
     const searchTerm = req.query.query || "";
     const categoryFilter = req.query.category;
     const subCategoryFilter = req.query.subCategory;
     const userId = req.query.userId;
 
-    let userConditions = [];
-    if (userId) {
-      const user = await User.findById(userId).lean();
-      if (user) {
-        userConditions.push(...(user.diagnosedDiseases || []));
-        userConditions.push(...extractHealthConditions(user.healthStatus));
-      }
-    }
-    const regexTerm = new RegExp(searchTerm, "i");
-
+    /* ---------- build base Mongo query ---------- */
     const query = {};
 
-    if (searchTerm) {
+    /* 1. FREE-TEXT SEARCH (name / description) ---------------------- */
+    if (searchTerm.trim()) {
+      const regex = new RegExp(searchTerm, "i");
       query.$or = [
-        { name: { $regex: regexTerm } },
-        { description: { $regex: regexTerm } },
+        { name: { $regex: regex } },
+        { description: { $regex: regex } },
       ];
     }
 
-    let categoryIds = [];
+    /* 2. CATEGORY FILTER ------------------------------------------- */
     if (categoryFilter) {
-      const categoryQuery = mongoose.Types.ObjectId.isValid(categoryFilter)
+      const catLookup = mongoose.Types.ObjectId.isValid(categoryFilter)
         ? { _id: categoryFilter }
         : { name: { $regex: new RegExp("^" + categoryFilter + "$", "i") } };
-      const categoryDocs = await Category.find(categoryQuery).lean();
-      categoryIds = categoryDocs.map((c) => c._id);
-      if (categoryIds.length > 0) {
-        query.category = { $in: categoryIds };
+
+      const catDocs = await Category.find(catLookup).lean();
+      if (catDocs.length) {
+        query.category = { $in: catDocs.map((c) => c._id) };
+      } else {
+        // unknown category ⇒ empty result set
+        return res.json([]);
       }
     }
 
+    /* 3. SUB-CATEGORY FILTER --------------------------------------- */
     if (subCategoryFilter) {
+      // find categories that contain the sub-category
       const catsWithSub = await Category.find({
         subCategories: {
           $regex: new RegExp("^" + subCategoryFilter + "$", "i"),
         },
       }).lean();
-      const catIdsWithSub = catsWithSub.map((c) => c._id);
-      if (catIdsWithSub.length > 0) {
-        query.category = { $in: catIdsWithSub };
+      if (catsWithSub.length) {
+        query.category = { $in: catsWithSub.map((c) => c._id) };
         query.subCategory = {
           $regex: new RegExp("^" + subCategoryFilter + "$", "i"),
         };
+      } else {
+        return res.json([]);
       }
     }
-    if (userConditions.length > 0) {
-      query.avoidIf = { $nin: userConditions };
+
+    /* 4. USER HEALTH “AVOID IF” FILTER ------------------------------ */
+    if (userId && mongoose.Types.ObjectId.isValid(userId)) {
+      const user = await User.findById(userId).lean();
+      if (user) {
+        const avoid = [
+          ...(user.diagnosedDiseases || []),
+          ...extractHealthConditions(user.healthStatus),
+        ];
+        if (avoid.length)
+          query.avoidIf = { $nin: avoid.map((s) => s.toLowerCase()) };
+      }
     }
-    // Execute query
-    const products = await Product.find(query).populate("category").lean();
-    res.json(products);
+
+    /* ---------- execute query, populate ratings → user ------------- */
+    const products = await Product.find(query)
+      .populate(ratingPopulate)
+      .lean({ virtuals: true });
+
+    /* ---------- enrich each product with rating + category info ---- */
+    const productsWithDetails = await Promise.all(
+      products.map(async (p) => ({
+        ...p,
+        categoryName: await getCategoryNameById(p.categoryId),
+        averageRating: p.averageRating,
+        ratingCount: p.ratings.length,
+        ratingDetails: buildRatingDetails(p.ratings),
+      }))
+    );
+
+    /* ---------- response ------------------------------------------ */
+    res.status(200).json({
+      success: true,
+      msg: "Products fetched successfully",
+      data: productsWithDetails,
+    });
   } catch (err) {
-    console.error("Error in searchAndFilterProducts:", err);
+    console.error("Error in searchAndFilterProductsV2:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });

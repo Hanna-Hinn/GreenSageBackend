@@ -23,10 +23,20 @@ const stripe = require("stripe")(process.env.SECRET_KEY, {
 // createOrder Endpoint/API
 const createOrder = asyncWrapper(async (req, res, next) => {
   const { id: userId } = req.params;
-  const { shipmentStatus = "pending", paymentMethod = "cod" } = req.body;
+  const {
+    shipmentStatus = "pending",
+    paymentMethod = "cod",
+    addressId,
+  } = req.body;
 
   if (!mongoose.Types.ObjectId.isValid(userId))
     return next(createCustomError(`Invalid user ID: ${userId}`, 400));
+
+  if (!addressId || !mongoose.Types.ObjectId.isValid(addressId)) {
+    return next(
+      createCustomError(`Invalid or missing address ID: ${addressId}`, 400)
+    );
+  }
 
   const cart = await Cart.findOne({ userId });
   if (!cart) return next(createCustomError("Cart not found", 404));
@@ -37,7 +47,20 @@ const createOrder = asyncWrapper(async (req, res, next) => {
   if (!user) return next(createCustomError("User not found", 404));
 
   const userName = `${user.firstName} ${user.lastName}`;
-  const selectedAddress = user.addresses[0]; // first address
+  const selectedAddress =
+    typeof user.addresses.id === "function"
+      ? user.addresses.id(addressId)
+      : user.addresses.find((a) => a._id.toString() === addressId);
+
+  if (!selectedAddress) {
+    return next(
+      createCustomError(
+        `Address ${addressId} not found for user ${userId}`,
+        404
+      )
+    );
+  }
+
   const { totalPrice, cartItems } = cart;
   const totalPriceValue =
     cart.totalPrice instanceof mongoose.Types.Decimal128
@@ -216,6 +239,7 @@ const createPaymentIntent = asyncWrapper(async (req, res, next) => {
     },
     amount: adjustedTotalPrice,
     currency: "usd",
+    payment_method_types: ["card"],
   });
 
   console.log(paymentIntent);

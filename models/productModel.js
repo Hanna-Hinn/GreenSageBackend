@@ -87,17 +87,17 @@ const productSchema = new mongoose.Schema({
 
 // Virtual field for calculated average rating
 productSchema.virtual("averageRating").get(function () {
-  // Calculate the average rating from the 'ratings' array
-  const ratings = this.ratings;
-  if (ratings.length === 0) {
-    return 0;
-  }
+  if (!Array.isArray(this.ratings) || this.ratings.length === 0) return 0;
 
-  const sum = ratings.reduce((acc, rating) => acc + Number(rating.rating), 0);
-  const average = sum / ratings.length;
-  return average;
+  const numeric = this.ratings
+    .map((r) => (r && r.rating ? Number(r.rating) : null))
+    .filter((v) => typeof v === "number");
+
+  if (!numeric.length) return 0;
+  return numeric.reduce((acc, v) => acc + v, 0) / numeric.length;
 });
 
-// productSchema.set('toJSON', { getters: true });
+productSchema.set("toJSON",  { virtuals: true });
+productSchema.set("toObject", { virtuals: true });
 
 module.exports = mongoose.model("Product", productSchema);
