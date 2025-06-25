@@ -38,6 +38,8 @@ router.post(
       addresses,
       healthStatus,
       diagnosedDiseases = [],
+      description = "",
+      role = "customer",
     } = req.body;
 
     if (
@@ -99,10 +101,11 @@ router.post(
       mobile,
       password,
       imageUrl,
-      role: "customer",
+      role: role,
       addresses: userAddresses,
       healthStatus: healthStatusObj,
       diagnosedDiseases: normaliseDiseases(diagnosedDiseases),
+      description: description || "",
     });
 
     const savedUser = await newUser.save().catch((err) => {

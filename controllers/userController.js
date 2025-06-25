@@ -125,9 +125,21 @@ const createUser = asyncWrapper(async (req, res, next) => {
 
 // getUsers Endpoint/API
 const getUsers = asyncWrapper(async (req, res, next) => {
-  const users = await User.find({});
+  /* optional filters */
+  const { ownersOnly, role } = req.query;
+
+  const filter = {};
+  if (ownersOnly === "true") {
+    filter.role = "owner";
+  } else if (role) {
+    filter.role = role; // generic role filter
+  }
+
+  /* fetch users, omit password */
+  const users = await User.find(filter).select("-password");
+
   res.status(200).json({
-    msg: `Users fetched successfully`,
+    msg: "Users fetched successfully",
     success: true,
     data: users,
   });
@@ -236,10 +248,7 @@ const deleteUser = asyncWrapper(async (req, res, next) => {
 
 // getOwners Endpoint/API
 const getOwners = asyncWrapper(async (req, res, next) => {
-  const owners = await User.find(
-    { role: "owner" },
-    { healthStatus: 0, ratings: 0, orders: 0 }
-  );
+  const owners = await User.find({ role: "owner" });
 
   // Get product counts for each owner
   const ownersWithProductCount = await Promise.all(

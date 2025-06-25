@@ -29,15 +29,15 @@ const createOrder = asyncWrapper(async (req, res, next) => {
     addressId,
   } = req.body;
 
+  /* ---------- sanity checks ---------- */
   if (!mongoose.Types.ObjectId.isValid(userId))
     return next(createCustomError(`Invalid user ID: ${userId}`, 400));
-
-  if (!addressId || !mongoose.Types.ObjectId.isValid(addressId)) {
+  if (!addressId || !mongoose.Types.ObjectId.isValid(addressId))
     return next(
       createCustomError(`Invalid or missing address ID: ${addressId}`, 400)
     );
-  }
 
+  /* ---------- pull cart + user ---------- */
   const cart = await Cart.findOne({ userId });
   if (!cart) return next(createCustomError("Cart not found", 404));
   if (!cart.cartItems.length)
@@ -46,29 +46,28 @@ const createOrder = asyncWrapper(async (req, res, next) => {
   const user = await User.findById(userId);
   if (!user) return next(createCustomError("User not found", 404));
 
+  /* ---------- derive basics ---------- */
   const userName = `${user.firstName} ${user.lastName}`;
   const selectedAddress =
     typeof user.addresses.id === "function"
       ? user.addresses.id(addressId)
       : user.addresses.find((a) => a._id.toString() === addressId);
 
-  if (!selectedAddress) {
+  if (!selectedAddress)
     return next(
       createCustomError(
         `Address ${addressId} not found for user ${userId}`,
         404
       )
     );
-  }
 
-  const { totalPrice, cartItems } = cart;
   const totalPriceValue =
     cart.totalPrice instanceof mongoose.Types.Decimal128
       ? parseFloat(cart.totalPrice.toString())
       : cart.totalPrice;
-
   const adjustedTotalPrice = totalPriceValue + DELIVERY_FEES;
 
+  /* ---------- create order ---------- */
   const order = await Order.create({
     userId,
     date: new Date(),
@@ -77,11 +76,11 @@ const createOrder = asyncWrapper(async (req, res, next) => {
     shipmentStatus,
     userAddress: selectedAddress,
     totalPrice: adjustedTotalPrice,
-    cartItems,
+    cartItems: cart.cartItems,
     userName,
   });
 
-  const cartItemIds = cartItems.map((ci) => ci._id);
+  /* ----------   STOCK decrement & cart cleanup  ---------- */
   await updateProductStockInCart(order._id);
 
   await user.updateOne({ $push: { orders: order._id } });
@@ -90,11 +89,33 @@ const createOrder = asyncWrapper(async (req, res, next) => {
     totalItems: 0,
     $set: { cartItems: [] },
   });
+  const cartItemIds = cart.cartItems.map((ci) => ci._id);
   await Product.updateMany(
     { cartItems: { $in: cartItemIds } },
     { $pullAll: { cartItems: cartItemIds } }
   );
 
+  /* ----------   📎 link order to each vendor / owner  ---------- */
+  const ownerNames = [
+    ...new Set(
+      cart.cartItems.map((ci) => ci.ownerName || ci.owner).filter(Boolean)
+    ),
+  ];
+
+  await Promise.all(
+    ownerNames.map(async (fullName) => {
+      const [firstName, ...rest] = fullName.trim().split(" ");
+      const lastName = rest.join(" ");
+      if (!firstName || !lastName) return;
+
+      await User.updateOne(
+        { firstName, lastName, role: "owner" },
+        { $addToSet: { orders: order._id } } // no duplicates
+      );
+    })
+  );
+
+  /* ----------   Stripe invoice (unchanged)   ---------- */
   let stripeCustomerId = user.stripeCustomerId;
   if (!stripeCustomerId) {
     const customer = await stripe.customers.create({
@@ -106,12 +127,11 @@ const createOrder = asyncWrapper(async (req, res, next) => {
     await user.save();
   }
 
-  for (const ci of cartItems) {
+  for (const ci of cart.cartItems) {
     const priceValue =
       ci.price instanceof mongoose.Types.Decimal128
         ? parseFloat(ci.price.toString())
         : ci.price;
-
     await stripe.invoiceItems.create({
       customer: stripeCustomerId,
       description: ci.productName,
@@ -120,16 +140,6 @@ const createOrder = asyncWrapper(async (req, res, next) => {
       currency: "usd",
     });
   }
-
-  console.log("Cart items with prices:");
-  cartItems.forEach((ci, i) => {
-    console.log(`Item ${i + 1}:`, {
-      price: ci.price,
-      type: typeof ci.price,
-      asString: ci.price.toString(),
-      asFloat: parseFloat(ci.price.toString()),
-    });
-  });
 
   await stripe.invoiceItems.create({
     customer: stripeCustomerId,
@@ -265,7 +275,18 @@ async function updateProductStockInCart(orderId) {
 
 // getOrders Endpoint/API
 const getOrders = asyncWrapper(async (req, res, next) => {
-  const orders = await Order.find();
+  const { ownerId } = req.query;
+
+  let orders;
+  if (ownerId && mongoose.Types.ObjectId.isValid(ownerId)) {
+    const owner = await User.findById(ownerId).select("orders");
+    if (!owner)
+      return next(createCustomError(`No owner found with id ${ownerId}`, 404));
+
+    orders = await Order.find({ _id: { $in: owner.orders } });
+  } else {
+    orders = await Order.find();
+  }
 
   res.status(200).json({
     success: true,
@@ -455,58 +476,82 @@ const updateOrderStatus = asyncWrapper(async (req, res, next) => {
 const getOwnerOrders = asyncWrapper(async (req, res, next) => {
   const { id: userId } = req.params;
 
-  // Check if the userId is a valid ObjectId
+  /* ---------- validate owner id ---------- */
   if (!mongoose.Types.ObjectId.isValid(userId)) {
-    return next(createCustomError(`Invalid orderId ID: ${userId}`, 400));
+    return next(createCustomError(`Invalid userId ID: ${userId}`, 400));
   }
 
-  const user = await User.findById(userId);
-  const fullName = `${user.firstName} ${user.lastName}`;
-  // console.log(fullName);
+  /* ---------- fetch owner (vendor) ---------- */
+  const owner = await User.findById(userId).select("firstName lastName");
+  if (!owner) {
+    return next(createCustomError("Owner not found", 404));
+  }
+  const ownerFullName = `${owner.firstName} ${owner.lastName}`; // ← string stored in cartItems.ownerName
 
-  const orders = await Order.find({});
-  const allCartItems = orders.flatMap((order) => order.cartItems);
+  console.log("OWNER", ownerFullName);
 
-  const matchingCartItems = allCartItems.filter(
-    (item) => item.ownerName === fullName
-  );
-  // console.log(matchingCartItems);
+  /* ---------- pull ONLY the orders that mention that owner ---------- */
+  const rawOrders = await Order.find({
+    "cartItems.ownerName": ownerFullName,
+  }).lean();
 
-  const matchingOrders = orders
-    .filter((order) =>
-      order.cartItems.some((cartItem) =>
-        matchingCartItems.some((matchingItem) =>
-          matchingItem._id.equals(cartItem._id)
-        )
-      )
-    )
-    .map((order) => {
-      const matchingOrder = {
-        ...order.toObject(),
-        cartItems: order.cartItems
-          .filter((cartItem) =>
-            matchingCartItems.some((matchingItem) =>
-              matchingItem._id.equals(cartItem._id)
-            )
-          )
-          .flat(), // Flatten the cartItems array
-      };
+  console.log(rawOrders);
 
-      // Calculate the correct total price for matchingOrder
-      matchingOrder.totalPrice = matchingOrder.cartItems.reduce(
-        (total, cartItem) => total + cartItem.itemTotalPrice,
-        0
-      );
+  /* ---------- keep only the owner’s items & recalc order totals ----- */
+  const matchingOrders = rawOrders.map((o) => {
+    const shopItems = o.cartItems.filter(
+      (ci) => ci.ownerName === ownerFullName
+    );
 
-      return matchingOrder;
-    });
+    const newTotal = shopItems.reduce(
+      (sum, ci) =>
+        sum +
+        (typeof ci.itemTotalPrice === "number"
+          ? ci.itemTotalPrice
+          : Number(ci.itemTotalPrice?.$numberDecimal || 0)),
+      0
+    );
 
-  const OrdersNumber = matchingOrders.length;
+    return {
+      ...o,
+      cartItems: shopItems,
+      totalPrice: newTotal,
+    };
+  });
 
   res.status(200).json({
     success: true,
     message: "Owner orders fetched successfully",
-    data: { matchingOrders, OrdersNumber },
+    data: matchingOrders,
+  });
+});
+
+const getOwnerProducts = asyncWrapper(async (req, res, next) => {
+  const { id: userId } = req.params;
+
+  /* ---------- validate owner id ---------- */
+  if (!mongoose.Types.ObjectId.isValid(userId)) {
+    return next(createCustomError(`Invalid userId ID: ${userId}`, 400));
+  }
+
+  /* ---------- fetch owner ---------- */
+  const owner = await User.findById(userId).select("firstName lastName");
+  if (!owner) {
+    return next(createCustomError("Owner not found", 404));
+  }
+  const fullName = `${owner.firstName} ${owner.lastName}`;
+
+  /* ---------- pull products for that owner ---------- */
+  // `owner` in Product schema stores the seller’s full name
+  const products = await Product.find({ owner: fullName }).lean({
+    virtuals: true,
+  });
+
+  res.status(200).json({
+    success: true,
+    msg: "Owner products fetched successfully",
+    data: products, // already includes `averageRating` virtual
+    count: products.length,
   });
 });
 
@@ -518,4 +563,5 @@ module.exports = {
   updateOrderStatus,
   getOwnerOrders,
   createPaymentIntent,
+  getOwnerProducts,
 };
